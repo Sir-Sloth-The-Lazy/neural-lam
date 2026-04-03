@@ -153,6 +153,7 @@ class ForecasterModule(pl.LightningModule):
         forecast_result = self._normalize_forecaster_output(
             self.forecaster(init_states, forcing_features, target_states)
         )
+        self._validate_forecast_result(forecast_result, target_states)
         return forecast_result, target_states
 
     def forecast_for_batch(self, batch):
@@ -201,6 +202,60 @@ class ForecasterModule(pl.LightningModule):
         prediction, pred_std = output
         return ForecastResult(prediction=prediction, pred_std=pred_std)
 
+    @staticmethod
+    def _validate_forecast_result(
+        forecast_result: ForecastResult, target_states: torch.Tensor
+    ) -> None:
+        """Validate deterministic and ensemble forecast tensor contracts."""
+        prediction = forecast_result.prediction
+        pred_std = forecast_result.pred_std
+
+        deterministic_shape = target_states.shape
+        ensemble_shape = (
+            target_states.shape[0],
+            None,
+            *target_states.shape[1:],
+        )
+
+        if prediction.ndim == target_states.ndim:
+            if prediction.shape != deterministic_shape:
+                raise ValueError(
+                    "Deterministic predictions must have shape "
+                    f"{deterministic_shape}, got {tuple(prediction.shape)}."
+                )
+        elif prediction.ndim == target_states.ndim + 1:
+            if (
+                prediction.shape[0] != ensemble_shape[0]
+                or prediction.shape[2:] != ensemble_shape[2:]
+            ):
+                raise ValueError(
+                    "Ensemble predictions must have shape "
+                    f"(B, S, T, N, d_f) matching target {deterministic_shape}, "
+                    f"got {tuple(prediction.shape)}."
+                )
+        else:
+            raise ValueError(
+                "Forecaster predictions must follow either the deterministic "
+                "(B, T, N, d_f) or ensemble (B, S, T, N, d_f) contract."
+            )
+
+        if pred_std is None:
+            return
+        if pred_std.ndim == 1:
+            if pred_std.shape[0] != target_states.shape[-1]:
+                raise ValueError(
+                    "One-dimensional pred_std must match the state feature "
+                    f"dimension {target_states.shape[-1]}, got "
+                    f"{pred_std.shape[0]}."
+                )
+            return
+        if pred_std.shape != prediction.shape:
+            raise ValueError(
+                "pred_std must either match prediction shape or be shaped "
+                f"(d_f,). Got prediction {tuple(prediction.shape)} and "
+                f"pred_std {tuple(pred_std.shape)}."
+            )
+
     def training_step(self, batch):
         prediction, target_states, pred_std = self.forecast_for_batch(batch)
         if pred_std is None:
@@ -236,10 +291,7 @@ class ForecasterModule(pl.LightningModule):
 
     # pylint: disable-next=unused-argument
     def validation_step(self, batch, batch_idx):
-        init_states, target_states, forcing_features, _batch_times = batch
-        prediction, pred_std = self.forecaster(
-            init_states, forcing_features, target_states
-        )
+        prediction, target_states, pred_std = self.forecast_for_batch(batch)
         if pred_std is None:
             pred_std = self.per_var_std
 
@@ -284,10 +336,7 @@ class ForecasterModule(pl.LightningModule):
 
     # pylint: disable-next=unused-argument
     def test_step(self, batch, batch_idx):
-        init_states, target_states, forcing_features, _batch_times = batch
-        prediction, pred_std = self.forecaster(
-            init_states, forcing_features, target_states
-        )
+        prediction, target_states, pred_std = self.forecast_for_batch(batch)
 
         if pred_std is not None:
             mean_pred_std = torch.mean(

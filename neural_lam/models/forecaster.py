@@ -22,6 +22,11 @@ class ForecastResult:
     pred_std: Optional[torch.Tensor] = None
     aux_data: dict[str, Any] = field(default_factory=dict)
 
+    @property
+    def is_ensemble_prediction(self) -> bool:
+        """Whether the prediction carries an explicit sample dimension."""
+        return self.prediction.ndim == 5
+
 
 class Forecaster(nn.Module, ABC):
     """
@@ -47,7 +52,9 @@ class Forecaster(nn.Module, ABC):
         forcing_features: (B, pred_steps, num_grid_nodes, d_static_f)
         boundary_states: (B, pred_steps, num_grid_nodes, d_f)
         Returns:
-            prediction: (B, pred_steps, num_grid_nodes, d_f)
-            pred_std: (B, pred_steps, num_grid_nodes, d_f) or (d_f,)
+            prediction: either (B, pred_steps, num_grid_nodes, d_f) for
+                deterministic outputs or (B, S, pred_steps, num_grid_nodes,
+                d_f) for sample-based ensemble outputs.
+            pred_std: same shape as prediction, or (d_f,), or None
         """
         pass

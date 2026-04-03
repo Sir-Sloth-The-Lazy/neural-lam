@@ -1,4 +1,5 @@
 # Third-party
+import pytest
 import pytorch_lightning as pl
 import torch
 
@@ -55,6 +56,23 @@ class MockStructuredForecaster(Forecaster):
             pred_std=pred_std[:, :pred_steps] if pred_std is not None else None,
             aux_data={"posterior_loc": torch.zeros(())},
         )
+
+
+class MockStructuredEnsembleForecaster(Forecaster):
+    def __init__(self, ensemble_size: int = 4):
+        super().__init__()
+        self.ensemble_size = ensemble_size
+
+    @property
+    def predicts_std(self) -> bool:
+        return True
+
+    def forward(self, init_states, forcing_features, boundary_states):
+        prediction = boundary_states.unsqueeze(1).repeat(
+            1, self.ensemble_size, 1, 1, 1
+        )
+        pred_std = torch.full_like(prediction, 0.25)
+        return ForecastResult(prediction=prediction, pred_std=pred_std)
 
 
 def test_ar_forecaster_unroll():
@@ -411,3 +429,77 @@ def test_forecaster_module_normalizes_legacy_tuple_output():
     assert isinstance(result, ForecastResult)
     assert result.prediction is prediction
     assert result.pred_std is pred_std
+
+
+def test_forecaster_module_accepts_ensemble_shape_contract():
+    datastore = DummyDatastore()
+    config = nlconfig.NeuralLAMConfig(
+        datastore=nlconfig.DatastoreSelection(
+            kind=datastore.SHORT_NAME, config_path=datastore.root_path
+        )
+    )
+    model = ForecasterModule(
+        forecaster=MockStructuredEnsembleForecaster(ensemble_size=4),
+        config=config,
+        datastore=datastore,
+        loss="nll",
+        lr=1e-3,
+        restore_opt=False,
+        n_example_pred=1,
+        val_steps_to_log=[1],
+        metrics_watch=[],
+    )
+
+    batch_size = 2
+    pred_steps = 3
+    num_grid_nodes = datastore.num_grid_points
+    d_state = datastore.get_num_data_vars(category="state")
+    d_forcing = datastore.get_num_data_vars(category="forcing")
+
+    batch = (
+        torch.zeros(batch_size, 2, num_grid_nodes, d_state),
+        torch.ones(batch_size, pred_steps, num_grid_nodes, d_state),
+        torch.zeros(batch_size, pred_steps, num_grid_nodes, d_forcing),
+        torch.zeros(batch_size, pred_steps, dtype=torch.int64),
+    )
+
+    forecast_result, forecast_target = model.forecast_result_for_batch(batch)
+    assert forecast_result.is_ensemble_prediction
+    assert forecast_result.prediction.shape == (
+        batch_size,
+        4,
+        pred_steps,
+        num_grid_nodes,
+        d_state,
+    )
+    assert forecast_target.shape == batch[1].shape
+
+    prediction, _, pred_std = model.forecast_for_batch(batch)
+    assert prediction.shape == forecast_result.prediction.shape
+    assert pred_std is not None
+    assert pred_std.shape == prediction.shape
+
+
+def test_forecaster_module_rejects_invalid_prediction_shape():
+    target_states = torch.zeros(2, 3, 4, 5)
+    invalid_result = ForecastResult(prediction=torch.zeros(2, 4, 5))
+
+    with pytest.raises(
+        ValueError, match="Forecaster predictions must follow either"
+    ):
+        ForecasterModule._validate_forecast_result(
+            invalid_result, target_states
+        )
+
+
+def test_forecaster_module_rejects_invalid_pred_std_shape():
+    target_states = torch.zeros(2, 3, 4, 5)
+    invalid_result = ForecastResult(
+        prediction=torch.zeros_like(target_states),
+        pred_std=torch.zeros(2, 3, 4, 6),
+    )
+
+    with pytest.raises(ValueError, match="pred_std must either match"):
+        ForecasterModule._validate_forecast_result(
+            invalid_result, target_states
+        )
