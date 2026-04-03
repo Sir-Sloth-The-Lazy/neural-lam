@@ -19,7 +19,7 @@ from ..config import NeuralLAMConfig
 from ..datastore import BaseDatastore
 from ..loss_weighting import get_state_feature_weighting
 from ..weather_dataset import WeatherDataset
-from .forecaster import Forecaster
+from .forecaster import ForecastResult, Forecaster
 
 
 class ForecasterModule(pl.LightningModule):
@@ -29,6 +29,7 @@ class ForecasterModule(pl.LightningModule):
     """
 
     # pylint: disable=arguments-differ
+    SUPPORTED_ENSEMBLE_MEAN_LOSSES = {"mse", "mae"}
 
     def __init__(
         self,
@@ -60,6 +61,7 @@ class ForecasterModule(pl.LightningModule):
         self.save_hyperparameters(ignore=["datastore", "forecaster"])
         self.datastore = datastore
         self.forecaster = forecaster
+        self.loss_name = loss.lower()
 
         # Compute interior_mask_bool directly from datastore
         boundary_mask = (
@@ -144,11 +146,173 @@ class ForecasterModule(pl.LightningModule):
         )
         return opt
 
-    def training_step(self, batch):
-        (init_states, target_states, forcing_features, _batch_times) = batch
-        prediction, pred_std = self.forecaster(
-            init_states, forcing_features, target_states
+    def forecast_result_for_batch(
+        self, batch
+    ) -> tuple[ForecastResult, torch.Tensor]:
+        """Run the forecaster on a batch and return a structured result."""
+        init_states, target_states, forcing_features, _batch_times = batch
+
+        forecast_result = self._normalize_forecaster_output(
+            self.forecaster(init_states, forcing_features, target_states)
         )
+        self._validate_forecast_result(forecast_result, target_states)
+        self._validate_ensemble_loss_support(forecast_result)
+        return forecast_result, target_states
+
+    def forecast_for_batch(self, batch):
+        """Run the forecaster on a batch and return predictions.
+
+        Unpacks the batch, runs the forecaster, and returns the raw pred_std
+        (None if the forecaster does not output uncertainty estimates).
+
+        Parameters
+        ----------
+        batch : tuple
+            Tuple of (init_states, target_states, forcing_features,
+            batch_times) tensors from the dataloader.
+
+        Returns
+        -------
+        prediction : torch.Tensor
+            Predicted states.
+        target_states : torch.Tensor
+            Ground-truth target states.
+        pred_std : torch.Tensor or None
+            Predicted standard deviations, or None if not output by model.
+        """
+        forecast_result, target_states = self.forecast_result_for_batch(batch)
+
+        return (
+            forecast_result.prediction,
+            target_states,
+            forecast_result.pred_std,
+        )
+
+    @staticmethod
+    def _normalize_forecaster_output(
+        output: ForecastResult | tuple[torch.Tensor, Optional[torch.Tensor]],
+    ) -> ForecastResult:
+        """Normalize legacy and structured forecaster outputs."""
+        if isinstance(output, ForecastResult):
+            return output
+
+        if not isinstance(output, tuple) or len(output) != 2:
+            raise TypeError(
+                "Forecaster must return either ForecastResult or "
+                "(prediction, pred_std)."
+            )
+
+        prediction, pred_std = output
+        return ForecastResult(prediction=prediction, pred_std=pred_std)
+
+    @staticmethod
+    def _validate_forecast_result(
+        forecast_result: ForecastResult, target_states: torch.Tensor
+    ) -> None:
+        """Validate deterministic and ensemble forecast tensor contracts."""
+        prediction = forecast_result.prediction
+        pred_std = forecast_result.pred_std
+
+        deterministic_shape = target_states.shape
+        ensemble_shape = (
+            target_states.shape[0],
+            None,
+            *target_states.shape[1:],
+        )
+
+        if prediction.ndim == target_states.ndim:
+            if prediction.shape != deterministic_shape:
+                raise ValueError(
+                    "Deterministic predictions must have shape "
+                    f"{deterministic_shape}, got {tuple(prediction.shape)}."
+                )
+        elif prediction.ndim == target_states.ndim + 1:
+            if (
+                prediction.shape[0] != ensemble_shape[0]
+                or prediction.shape[2:] != ensemble_shape[2:]
+            ):
+                raise ValueError(
+                    "Ensemble predictions must have shape "
+                    f"(B, S, T, N, d_f) matching target {deterministic_shape}, "
+                    f"got {tuple(prediction.shape)}."
+                )
+        else:
+            raise ValueError(
+                "Forecaster predictions must follow either the deterministic "
+                "(B, T, N, d_f) or ensemble (B, S, T, N, d_f) contract."
+            )
+
+        if pred_std is None:
+            return
+        if pred_std.ndim == 1:
+            if pred_std.shape[0] != target_states.shape[-1]:
+                raise ValueError(
+                    "One-dimensional pred_std must match the state feature "
+                    f"dimension {target_states.shape[-1]}, got "
+                    f"{pred_std.shape[0]}."
+                )
+            return
+        if pred_std.shape != prediction.shape:
+            raise ValueError(
+                "pred_std must either match prediction shape or be shaped "
+                f"(d_f,). Got prediction {tuple(prediction.shape)} and "
+                f"pred_std {tuple(pred_std.shape)}."
+            )
+
+    def _validate_ensemble_loss_support(
+        self, forecast_result: ForecastResult
+    ) -> None:
+        """
+        The initial ensemble path on top of #208 only supports deterministic
+        mean-path losses. Sample-aware probabilistic objectives belong in a
+        dedicated follow-on slice.
+        """
+        if (
+            forecast_result.is_ensemble_prediction
+            and self.loss_name not in self.SUPPORTED_ENSEMBLE_MEAN_LOSSES
+        ):
+            supported = ", ".join(sorted(self.SUPPORTED_ENSEMBLE_MEAN_LOSSES))
+            raise ValueError(
+                "Ensemble forecasters currently support only "
+                f"{supported} losses via the ensemble-mean path. "
+                f"Got '{self.loss_name}'."
+            )
+
+    @staticmethod
+    def _reduce_ensemble_prediction(
+        forecast_result: ForecastResult,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Reduce ensemble predictions to the deterministic contract expected by
+        the existing loss/metric code paths.
+        """
+        prediction = forecast_result.prediction
+        pred_std = forecast_result.pred_std
+
+        if not forecast_result.is_ensemble_prediction:
+            return prediction, pred_std
+
+        prediction = torch.mean(prediction, dim=1)
+        if pred_std is not None and pred_std.ndim == 5:
+            pred_std = torch.mean(pred_std, dim=1)
+
+        return prediction, pred_std
+
+    def _compute_ensemble_spread_metric(
+        self, prediction: torch.Tensor
+    ) -> torch.Tensor:
+        """Compute entrywise ensemble spread reduced to (B, T, d_f)."""
+        entry_spread = torch.std(prediction, dim=1, correction=0)
+        return metrics.mask_and_reduce_metric(
+            entry_spread,
+            mask=self.interior_mask_bool,
+            average_grid=True,
+            sum_vars=False,
+        )
+
+    def training_step(self, batch):
+        forecast_result, target_states = self.forecast_result_for_batch(batch)
+        prediction, pred_std = self._reduce_ensemble_prediction(forecast_result)
         if pred_std is None:
             pred_std = self.per_var_std
 
@@ -182,10 +346,8 @@ class ForecasterModule(pl.LightningModule):
 
     # pylint: disable-next=unused-argument
     def validation_step(self, batch, batch_idx):
-        (init_states, target_states, forcing_features, _batch_times) = batch
-        prediction, pred_std = self.forecaster(
-            init_states, forcing_features, target_states
-        )
+        forecast_result, target_states = self.forecast_result_for_batch(batch)
+        prediction, pred_std = self._reduce_ensemble_prediction(forecast_result)
         if pred_std is None:
             pred_std = self.per_var_std
 
@@ -221,7 +383,15 @@ class ForecasterModule(pl.LightningModule):
             mask=self.interior_mask_bool,
             sum_vars=False,
         )
-        self.val_metrics["mse"].append(entry_mses)
+        metric_name = (
+            "ensemble_mse" if forecast_result.is_ensemble_prediction else "mse"
+        )
+        self.val_metrics.setdefault(metric_name, []).append(entry_mses)
+
+        if forecast_result.is_ensemble_prediction:
+            self.val_metrics.setdefault("ensemble_spread", []).append(
+                self._compute_ensemble_spread_metric(forecast_result.prediction)
+            )
 
     def on_validation_epoch_end(self):
         self.aggregate_and_plot_metrics(self.val_metrics, prefix="val")
@@ -230,10 +400,8 @@ class ForecasterModule(pl.LightningModule):
 
     # pylint: disable-next=unused-argument
     def test_step(self, batch, batch_idx):
-        (init_states, target_states, forcing_features, _batch_times) = batch
-        prediction, pred_std = self.forecaster(
-            init_states, forcing_features, target_states
-        )
+        forecast_result, target_states = self.forecast_result_for_batch(batch)
+        prediction, pred_std = self._reduce_ensemble_prediction(forecast_result)
 
         if pred_std is not None:
             mean_pred_std = torch.mean(
@@ -270,8 +438,13 @@ class ForecasterModule(pl.LightningModule):
             batch_size=batch[0].shape[0],
         )
 
-        for metric_name in ("mse", "mae"):
-            metric_func = metrics.get_metric(metric_name)
+        metric_name_map = (
+            {"ensemble_mse": "mse", "ensemble_mae": "mae"}
+            if forecast_result.is_ensemble_prediction
+            else {"mse": "mse", "mae": "mae"}
+        )
+        for metric_name, base_metric_name in metric_name_map.items():
+            metric_func = metrics.get_metric(base_metric_name)
             batch_metric_vals = metric_func(
                 prediction,
                 target_states,
@@ -279,7 +452,14 @@ class ForecasterModule(pl.LightningModule):
                 mask=self.interior_mask_bool,
                 sum_vars=False,
             )
-            self.test_metrics[metric_name].append(batch_metric_vals)
+            self.test_metrics.setdefault(metric_name, []).append(
+                batch_metric_vals
+            )
+
+        if forecast_result.is_ensemble_prediction:
+            self.test_metrics.setdefault("ensemble_spread", []).append(
+                self._compute_ensemble_spread_metric(forecast_result.prediction)
+            )
 
         spatial_loss = self.loss(
             prediction, target_states, pred_std, average_grid=False
@@ -461,6 +641,8 @@ class ForecasterModule(pl.LightningModule):
     def aggregate_and_plot_metrics(self, metrics_dict, prefix):
         log_dict = {}
         for metric_name, metric_val_list in metrics_dict.items():
+            if not metric_val_list:
+                continue
             metric_tensor = self.all_gather_cat(
                 torch.cat(metric_val_list, dim=0)
             )
@@ -540,9 +722,7 @@ class ForecasterModule(pl.LightningModule):
                     self.logger.log_image(key=key, images=[fig])
 
             pdf_loss_map_figs = [
-                vis.plot_spatial_error(
-                    error=loss_map, datastore=self.datastore
-                )
+                vis.plot_spatial_error(error=loss_map, datastore=self.datastore)
                 for loss_map in mean_spatial_loss
             ]
             pdf_loss_maps_dir = os.path.join(
