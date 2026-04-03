@@ -5,6 +5,7 @@ import torch
 # First-party
 from neural_lam import config as nlconfig
 from neural_lam.models.ar_forecaster import ARForecaster
+from neural_lam.models.forecaster import ForecastResult, Forecaster
 from neural_lam.models.forecaster_module import ForecasterModule
 from neural_lam.models.step_predictor import StepPredictor
 from tests.conftest import init_datastore_example
@@ -30,6 +31,30 @@ class MockStepPredictor(StepPredictor):
         pred_state = torch.zeros_like(prev_state)
         pred_std = torch.zeros_like(prev_state) if self.output_std else None
         return pred_state, pred_std
+
+
+class MockStructuredForecaster(Forecaster):
+    def __init__(self, predicts_std: bool):
+        super().__init__()
+        self._predicts_std = predicts_std
+
+    @property
+    def predicts_std(self) -> bool:
+        return self._predicts_std
+
+    def forward(self, init_states, forcing_features, boundary_states):
+        pred_steps = forcing_features.shape[1]
+        prediction = boundary_states.clone()
+        pred_std = (
+            torch.full_like(boundary_states, 0.5)
+            if self._predicts_std
+            else None
+        )
+        return ForecastResult(
+            prediction=prediction[:, :pred_steps],
+            pred_std=pred_std[:, :pred_steps] if pred_std is not None else None,
+            aux_data={"posterior_loc": torch.zeros(())},
+        )
 
 
 def test_ar_forecaster_unroll():
@@ -326,3 +351,63 @@ def test_step_predictor_no_static_features():
     )
     assert prediction.shape == (B, 1, num_grid_nodes, d_state)
     assert pred_std is None
+
+
+def test_forecaster_module_accepts_structured_forecast_output():
+    datastore = DummyDatastore()
+    config = nlconfig.NeuralLAMConfig(
+        datastore=nlconfig.DatastoreSelection(
+            kind=datastore.SHORT_NAME, config_path=datastore.root_path
+        )
+    )
+    forecaster = MockStructuredForecaster(predicts_std=True)
+
+    model = ForecasterModule(
+        forecaster=forecaster,
+        config=config,
+        datastore=datastore,
+        loss="nll",
+        lr=1e-3,
+        restore_opt=False,
+        n_example_pred=1,
+        val_steps_to_log=[1],
+        metrics_watch=[],
+    )
+
+    batch_size = 2
+    pred_steps = 3
+    num_grid_nodes = datastore.num_grid_points
+    d_state = datastore.get_num_data_vars(category="state")
+    d_forcing = datastore.get_num_data_vars(category="forcing")
+
+    batch = (
+        torch.zeros(batch_size, 2, num_grid_nodes, d_state),
+        torch.ones(batch_size, pred_steps, num_grid_nodes, d_state),
+        torch.zeros(batch_size, pred_steps, num_grid_nodes, d_forcing),
+        torch.zeros(batch_size, pred_steps, dtype=torch.int64),
+    )
+
+    forecast_result, forecast_target = model.forecast_result_for_batch(batch)
+    assert isinstance(forecast_result, ForecastResult)
+    assert forecast_target.shape == batch[1].shape
+    assert "posterior_loc" in forecast_result.aux_data
+
+    prediction, target, pred_std = model.forecast_for_batch(batch)
+    assert torch.allclose(prediction, target)
+    assert pred_std is not None
+    assert torch.all(pred_std == 0.5)
+
+    loss = model.training_step(batch)
+    assert torch.isfinite(loss)
+
+
+def test_forecaster_module_normalizes_legacy_tuple_output():
+    prediction = torch.zeros(2, 3, 4, 5)
+    pred_std = torch.ones_like(prediction)
+    result = ForecasterModule._normalize_forecaster_output(
+        (prediction, pred_std)
+    )
+
+    assert isinstance(result, ForecastResult)
+    assert result.prediction is prediction
+    assert result.pred_std is pred_std

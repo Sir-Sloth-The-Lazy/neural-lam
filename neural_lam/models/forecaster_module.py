@@ -19,7 +19,7 @@ from ..config import NeuralLAMConfig
 from ..datastore import BaseDatastore
 from ..loss_weighting import get_state_feature_weighting
 from ..weather_dataset import WeatherDataset
-from .forecaster import Forecaster
+from .forecaster import ForecastResult, Forecaster
 
 
 class ForecasterModule(pl.LightningModule):
@@ -144,11 +144,65 @@ class ForecasterModule(pl.LightningModule):
         )
         return opt
 
-    def training_step(self, batch):
-        (init_states, target_states, forcing_features, _batch_times) = batch
-        prediction, pred_std = self.forecaster(
-            init_states, forcing_features, target_states
+    def forecast_result_for_batch(
+        self, batch
+    ) -> tuple[ForecastResult, torch.Tensor]:
+        """Run the forecaster on a batch and return a structured result."""
+        init_states, target_states, forcing_features, _batch_times = batch
+
+        forecast_result = self._normalize_forecaster_output(
+            self.forecaster(init_states, forcing_features, target_states)
         )
+        return forecast_result, target_states
+
+    def forecast_for_batch(self, batch):
+        """Run the forecaster on a batch and return predictions.
+
+        Unpacks the batch, runs the forecaster, and returns the raw pred_std
+        (None if the forecaster does not output uncertainty estimates).
+
+        Parameters
+        ----------
+        batch : tuple
+            Tuple of (init_states, target_states, forcing_features,
+            batch_times) tensors from the dataloader.
+
+        Returns
+        -------
+        prediction : torch.Tensor
+            Predicted states.
+        target_states : torch.Tensor
+            Ground-truth target states.
+        pred_std : torch.Tensor or None
+            Predicted standard deviations, or None if not output by model.
+        """
+        forecast_result, target_states = self.forecast_result_for_batch(batch)
+
+        return (
+            forecast_result.prediction,
+            target_states,
+            forecast_result.pred_std,
+        )
+
+    @staticmethod
+    def _normalize_forecaster_output(
+        output: ForecastResult | tuple[torch.Tensor, Optional[torch.Tensor]],
+    ) -> ForecastResult:
+        """Normalize legacy and structured forecaster outputs."""
+        if isinstance(output, ForecastResult):
+            return output
+
+        if not isinstance(output, tuple) or len(output) != 2:
+            raise TypeError(
+                "Forecaster must return either ForecastResult or "
+                "(prediction, pred_std)."
+            )
+
+        prediction, pred_std = output
+        return ForecastResult(prediction=prediction, pred_std=pred_std)
+
+    def training_step(self, batch):
+        prediction, target_states, pred_std = self.forecast_for_batch(batch)
         if pred_std is None:
             pred_std = self.per_var_std
 
@@ -182,7 +236,7 @@ class ForecasterModule(pl.LightningModule):
 
     # pylint: disable-next=unused-argument
     def validation_step(self, batch, batch_idx):
-        (init_states, target_states, forcing_features, _batch_times) = batch
+        init_states, target_states, forcing_features, _batch_times = batch
         prediction, pred_std = self.forecaster(
             init_states, forcing_features, target_states
         )
@@ -230,7 +284,7 @@ class ForecasterModule(pl.LightningModule):
 
     # pylint: disable-next=unused-argument
     def test_step(self, batch, batch_idx):
-        (init_states, target_states, forcing_features, _batch_times) = batch
+        init_states, target_states, forcing_features, _batch_times = batch
         prediction, pred_std = self.forecaster(
             init_states, forcing_features, target_states
         )
@@ -540,9 +594,7 @@ class ForecasterModule(pl.LightningModule):
                     self.logger.log_image(key=key, images=[fig])
 
             pdf_loss_map_figs = [
-                vis.plot_spatial_error(
-                    error=loss_map, datastore=self.datastore
-                )
+                vis.plot_spatial_error(error=loss_map, datastore=self.datastore)
                 for loss_map in mean_spatial_loss
             ]
             pdf_loss_maps_dir = os.path.join(
