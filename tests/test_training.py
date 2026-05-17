@@ -13,7 +13,7 @@ from neural_lam import config as nlconfig
 from neural_lam.create_graph import create_graph_from_datastore
 from neural_lam.datastore import DATASTORES
 from neural_lam.datastore.base import BaseRegularGridDatastore
-from neural_lam.models.forecaster_module import ForecasterModule
+from neural_lam.models import ForecasterModule
 from neural_lam.weather_dataset import WeatherDataModule
 from tests.conftest import init_datastore_example
 
@@ -27,7 +27,12 @@ NUM_PAST_FORCING_STEPS = 1
 NUM_FUTURE_FORCING_STEPS = 1
 
 
-def run_simple_training(datastore, set_output_std, metrics_watch=None):
+def run_simple_training(
+    datastore,
+    set_output_std,
+    metrics_watch=None,
+    var_leads_metrics_watch=None,
+):
     """
     Run one epoch of a simple model training setup using the given datastore.
 
@@ -38,6 +43,10 @@ def run_simple_training(datastore, set_output_std, metrics_watch=None):
     set_output_std : bool
         If --output_std should be set during training
     """
+    if metrics_watch is None:
+        metrics_watch = []
+    if var_leads_metrics_watch is None:
+        var_leads_metrics_watch = {}
 
     if torch.cuda.is_available():
         device_name = "cuda"
@@ -99,12 +108,10 @@ def run_simple_training(datastore, set_output_std, metrics_watch=None):
     # Build predictor and forecaster externally, then inject into
     # ForecasterModule
     # First-party
-    from neural_lam.models import MODELS
-    from neural_lam.models.ar_forecaster import ARForecaster
+    from neural_lam.models import MODELS, ARForecaster
 
     predictor_class = MODELS["graph_lam"]
     predictor = predictor_class(
-        config=config,
         datastore=datastore,
         graph_name=graph_name,
         hidden_dim=HIDDEN_DIM,
@@ -114,6 +121,8 @@ def run_simple_training(datastore, set_output_std, metrics_watch=None):
         num_past_forcing_steps=NUM_PAST_FORCING_STEPS,
         num_future_forcing_steps=NUM_FUTURE_FORCING_STEPS,
         output_std=set_output_std,
+        output_clamping_lower=config.training.output_clamping.lower,
+        output_clamping_upper=config.training.output_clamping.upper,
     )
     forecaster = ARForecaster(predictor, datastore)
 
@@ -126,8 +135,8 @@ def run_simple_training(datastore, set_output_std, metrics_watch=None):
         restore_opt=False,
         n_example_pred=1,
         val_steps_to_log=[1, 3],
-        metrics_watch=[],
-        var_leads_metrics_watch={},
+        metrics_watch=metrics_watch,
+        var_leads_metrics_watch=var_leads_metrics_watch,
     )
     wandb.init(mode="disabled")  # Disable wandb for offline test run
     trainer.fit(model=model, datamodule=data_module)
@@ -139,8 +148,8 @@ def test_training(datastore_name):
 
     if not isinstance(datastore, BaseRegularGridDatastore):
         pytest.skip(
-            f"Skipping test for {datastore_name} as it is not a regular "
-            "grid datastore."
+            f"Skipping test for {datastore_name} as "
+            f"it is not a regular grid datastore."
         )
 
     run_simple_training(datastore, set_output_std=False)

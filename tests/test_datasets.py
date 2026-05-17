@@ -12,7 +12,7 @@ from neural_lam import config as nlconfig
 from neural_lam.create_graph import create_graph_from_datastore
 from neural_lam.datastore import DATASTORES
 from neural_lam.datastore.base import BaseRegularGridDatastore
-from neural_lam.models.forecaster_module import ForecasterModule
+from neural_lam.models import ForecasterModule
 from neural_lam.weather_dataset import WeatherDataset
 from tests.conftest import init_datastore_example
 from tests.dummy_datastore import DummyDatastore, EnsembleDummyDatastore
@@ -188,6 +188,8 @@ def test_single_batch(datastore_name, split):
         var_leads_metrics_watch = {}
         num_past_forcing_steps = 1
         num_future_forcing_steps = 1
+        val_steps_to_log = [1, 3]
+        ar_steps_eval = 5
 
     args = ModelArgs()
 
@@ -217,12 +219,10 @@ def test_single_batch(datastore_name, split):
     dataset = WeatherDataset(datastore=datastore, split=split, ar_steps=2)
 
     # First-party
-    from neural_lam.models import MODELS
-    from neural_lam.models.ar_forecaster import ARForecaster
+    from neural_lam.models import MODELS, ARForecaster
 
     predictor_class = MODELS["graph_lam"]
     predictor = predictor_class(
-        config=config,
         datastore=datastore,
         graph_name=args.graph,
         hidden_dim=args.hidden_dim,
@@ -232,6 +232,8 @@ def test_single_batch(datastore_name, split):
         num_past_forcing_steps=args.num_past_forcing_steps,
         num_future_forcing_steps=args.num_future_forcing_steps,
         output_std=args.output_std,
+        output_clamping_lower=config.training.output_clamping.lower,
+        output_clamping_upper=config.training.output_clamping.upper,
     )
     forecaster = ARForecaster(predictor, datastore=datastore)
 
