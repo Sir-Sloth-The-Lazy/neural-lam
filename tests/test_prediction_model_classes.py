@@ -1,7 +1,6 @@
 # Standard library
 from argparse import Namespace
 
-
 # Third-party
 import pytorch_lightning as pl
 import torch
