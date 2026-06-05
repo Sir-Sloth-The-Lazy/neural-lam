@@ -58,9 +58,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Fix `IndexError` in distributed flux stats gathering and silent diff stats shape corruption in `compute_standardization_stats.py` when running with `--distributed` and `world_size > 1` [\#411](https://github.com/mllam/neural-lam/pull/411) @RajdeepKushwaha5
 
+- Raise `ValueError` for unsupported `--logger` values in `setup_training_logger`, preventing a misleading `UnboundLocalError` on misconfigured logger types [\#463](https://github.com/mllam/neural-lam/pull/463) @Ritinikhil
+
+- Close the `PIL.Image` file handle and delete the temporary `.png` after upload in `CustomMLFlowLogger.log_image`, fixing a resource leak and temp-file accumulation in CWD; replace `sys.exit(1)` on `NoCredentialsError` with a re-raise so callers can handle the failure [\#496](https://github.com/mllam/neural-lam/pull/496) @Zrahay
+
+- Reset `plotted_examples` and clear `test_metrics` at the end of `on_test_epoch_end` so repeated `trainer.test()` calls on the same model instance regenerate example plots and start from a clean metric slate instead of silently skipping plots and accumulating tensors [\#437](https://github.com/mllam/neural-lam/pull/437) @RajdeepKushwaha5
+
+- Log every figure passed to `CustomMLFlowLogger.log_image` instead of silently dropping all but the first, using per-figure indexed keys (`{key}_{i}`) when more than one is supplied [\#499](https://github.com/mllam/neural-lam/pull/499) @Raj-Taware
+
 ### Maintenance
 
+- Add comprehensive type hints to `neural_lam/metrics.py` [\#447](https://github.com/mllam/neural-lam/pull/447) @sidhantpande
+
+- Add type hints to methods in `neural_lam/custom_loggers.py` [\#455](https://github.com/mllam/neural-lam/pull/455) @sidhantpande
+
 - Add comprehensive type hints to `neural_lam/gnn_layers.py` [\#647](https://github.com/mllam/neural-lam/pull/647) @GiGiKoneti
+
+- Add comprehensive type hints to `neural_lam/weather_dataset.py` [\#631](https://github.com/mllam/neural-lam/pull/631) @GiGiKoneti
+
+- Add comprehensive type hints to `neural_lam/vis.py` [\#625](https://github.com/mllam/neural-lam/pull/625) @GiGiKoneti
+
+- Add comprehensive type hints to `neural_lam/datastore/mdp.py` and `neural_lam/plot_graph.py` [\#622](https://github.com/mllam/neural-lam/pull/622) @GiGiKoneti
+
+- Group `train_model.py --help` output into logical sections (Core, Runtime, Model Architecture, Training, Evaluation, Logger, Metrics & Monitoring, Data Loading & Forcing) with a terminal-width-aware formatter [\#641](https://github.com/mllam/neural-lam/pull/641) @varma1221
 
 - Fix GPU CI torch version resolution to query the target wheel index instead of PyPI [\#639](https://github.com/mllam/neural-lam/pull/639) @Sir-Sloth-The-Lazy
 
