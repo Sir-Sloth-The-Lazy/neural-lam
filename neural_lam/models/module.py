@@ -338,7 +338,7 @@ class ForecasterModule(pl.LightningModule):
 
     def common_step(self, batch):
         """
-        Perform a common prediction step for training, validation, and testing.
+        Perform a common prediction step for validation and testing.
 
         Parameters
         ----------
@@ -362,6 +362,10 @@ class ForecasterModule(pl.LightningModule):
         """
         Perform a single training step.
 
+        The training objective is fully assembled by the wrapped forecaster;
+        this method injects the configured scoring rule and interior mask,
+        then logs the loss and any loss components the forecaster returns.
+
         Parameters
         ----------
         batch : tuple
@@ -372,20 +376,20 @@ class ForecasterModule(pl.LightningModule):
         torch.Tensor
             The computed loss for the training step.
         """
-        prediction, target_states, pred_std, _ = self.common_step(batch)
-        if pred_std is None:
-            pred_std = self.per_var_std
-
-        batch_loss = torch.mean(
-            self.loss(
-                prediction,
-                target_states,
-                pred_std,
-                mask=self.interior_mask_bool,
-            )
+        init_states, target_states, forcing_features, _ = batch
+        batch_loss, loss_components = self.forecaster.compute_training_loss(
+            init_states,
+            forcing_features,
+            target_states,
+            score_fn=self.loss,
+            interior_mask_bool=self.interior_mask_bool,
+            per_var_std=self.per_var_std,
         )
 
-        log_dict = {"train_loss": batch_loss}
+        log_dict = {
+            f"train_{name}": value for name, value in loss_components.items()
+        }
+        log_dict["train_loss"] = batch_loss
         self.log_dict(
             log_dict,
             prog_bar=True,
