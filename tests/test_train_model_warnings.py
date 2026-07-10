@@ -44,7 +44,8 @@ def test_eval_without_load_warning(eval_val, load_val, expect_warning):
 
 
 def test_create_gif_forwarded_to_forecaster_module():
-    """--create_gif must be forwarded to ForecasterModule.__init__."""
+    """--create_gif must be forwarded to
+    DeterministicForecasterModule.__init__."""
     mock_args = MagicMock()
     mock_args.eval = None
     mock_args.load = None
@@ -76,7 +77,8 @@ def test_create_gif_forwarded_to_forecaster_module():
         patch("neural_lam.train_model.MODELS", {"graph_lam": MagicMock()}),
         patch("neural_lam.train_model.ARForecaster"),
         patch(
-            "neural_lam.models.module.ForecasterModule.__init__",
+            "neural_lam.models.forecasters.deterministic_module."
+            "DeterministicForecasterModule.__init__",
             capture_init,
         ),
         pytest.raises(SystemExit),
@@ -85,5 +87,5 @@ def test_create_gif_forwarded_to_forecaster_module():
 
     assert (
         "create_gif" in captured_kwargs
-    ), "create_gif was not forwarded to ForecasterModule"
+    ), "create_gif was not forwarded to DeterministicForecasterModule"
     assert captured_kwargs["create_gif"] is True

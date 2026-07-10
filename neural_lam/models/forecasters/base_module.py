@@ -1,9 +1,10 @@
-"""Lightning module handling training, validation and testing loops."""
+"""Abstract Lightning module shared by deterministic and probabilistic
+forecaster modules."""
 
 # Standard library
 import os
 import warnings
-from typing import Any
+from abc import ABC, abstractmethod
 
 # Third-party
 import matplotlib.pyplot as plt
@@ -17,17 +18,26 @@ from PIL import Image
 from neural_lam.utils import get_integer_time
 
 # Local
-from .. import metrics, vis
-from ..config import NeuralLAMConfig
-from ..datastore import BaseDatastore
-from ..weather_dataset import WeatherDataset
-from .forecasters.base import Forecaster
+from ... import vis
+from ...config import NeuralLAMConfig
+from ...datastore import BaseDatastore
+from ...weather_dataset import WeatherDataset
+from .base import Forecaster
 
 
-class ForecasterModule(pl.LightningModule):
+class BaseForecasterModule(pl.LightningModule, ABC):
     """
-    Lightning module handling training, validation and testing loops.
-    Wraps a Forecaster instance which performs the actual prediction.
+    Abstract Lightning module wrapping a ``Forecaster``.
+
+    Owns everything that does not depend on whether the wrapped forecaster
+    produces a single deterministic forecast or samples an ensemble:
+    batch standardization, the training loop, optimizer configuration,
+    checkpoint compatibility, and the plotting/aggregation helpers used by
+    validation and testing. ``validation_step``, ``test_step`` and
+    ``on_test_epoch_end`` differ enough between the two evaluation modes
+    that they are left abstract; concrete subclasses implement them
+    independently (see ``DeterministicForecasterModule`` and
+    ``ProbabilisticForecasterModule``) rather than overriding one another.
     """
 
     # pylint: disable=arguments-differ
@@ -47,7 +57,7 @@ class ForecasterModule(pl.LightningModule):
         args=None,
     ):
         """
-        Initialize the ForecasterModule.
+        Initialize the BaseForecasterModule.
 
         Parameters
         ----------
@@ -190,16 +200,6 @@ class ForecasterModule(pl.LightningModule):
             self.forcing_mean = None
             self.forcing_std = None
 
-        self.val_metrics: dict[str, list] = {
-            "mse": [],
-        }
-        self.test_metrics: dict[str, list] = {
-            "mse": [],
-            "mae": [],
-        }
-        if self.forecaster.predicts_std:
-            self.test_metrics["output_std"] = []  # Treat as metric
-
         # For making restoring of optimizer state optional
         self.restore_opt = restore_opt
 
@@ -207,9 +207,6 @@ class ForecasterModule(pl.LightningModule):
         self.n_example_pred = n_example_pred
         self.create_gif = create_gif
         self.plotted_examples = 0
-
-        # For storing spatial loss maps during evaluation
-        self.spatial_loss_maps: list[Any] = []
 
         # Warn once per phase if val_steps_to_log exceeds the actual rollout
         self._val_steps_warn_issued = False
@@ -418,9 +415,14 @@ class ForecasterModule(pl.LightningModule):
             )
         setattr(self, flag, True)
 
+    @abstractmethod
     def validation_step(self, batch, batch_idx):
         """
         Perform a single validation step.
+
+        Concrete subclasses must both score the batch and populate
+        ``self.val_metrics`` for epoch-end aggregation by
+        ``on_validation_epoch_end``.
 
         Parameters
         ----------
@@ -429,44 +431,6 @@ class ForecasterModule(pl.LightningModule):
         batch_idx : int
             The index of the batch.
         """
-        prediction, target_states, pred_std, _ = self.common_step(batch)
-        if pred_std is None:
-            pred_std = self.forecaster.per_var_std
-
-        time_step_loss = torch.mean(
-            self.forecaster.loss(
-                prediction,
-                target_states,
-                pred_std,
-                mask=self.interior_mask_bool,
-            ),
-            dim=0,
-        )
-        mean_loss = torch.mean(time_step_loss)
-        self._warn_skipped_val_steps(len(time_step_loss), "val")
-
-        val_log_dict = {
-            f"val_loss_unroll{step}": time_step_loss[step - 1]
-            for step in self.hparams.val_steps_to_log
-            if step <= len(time_step_loss)
-        }
-        val_log_dict["val_mean_loss"] = mean_loss
-        self.log_dict(
-            val_log_dict,
-            on_step=False,
-            on_epoch=True,
-            sync_dist=True,
-            batch_size=batch[0].shape[0],
-        )
-
-        entry_mses = metrics.mse(
-            prediction,
-            target_states,
-            pred_std,
-            mask=self.interior_mask_bool,
-            sum_vars=False,
-        )
-        self.val_metrics["mse"].append(entry_mses)
 
     def on_validation_epoch_end(self):
         """
@@ -490,10 +454,14 @@ class ForecasterModule(pl.LightningModule):
         for metric_list in self.val_metrics.values():
             metric_list.clear()
 
-    # pylint: disable-next=unused-argument
+    @abstractmethod
     def test_step(self, batch, batch_idx):
         """
         Perform a single test step.
+
+        Concrete subclasses must both score the batch and populate
+        ``self.test_metrics`` for epoch-end aggregation by
+        ``on_test_epoch_end``.
 
         Parameters
         ----------
@@ -502,83 +470,6 @@ class ForecasterModule(pl.LightningModule):
         batch_idx : int
             The index of the batch.
         """
-        prediction, target_states, pred_std, _ = self.common_step(batch)
-
-        if pred_std is not None:
-            mean_pred_std = torch.mean(
-                pred_std[..., self.interior_mask_bool, :], dim=-2
-            )
-            self.test_metrics["output_std"].append(mean_pred_std)
-
-        if pred_std is None:
-            pred_std = self.forecaster.per_var_std
-
-        time_step_loss = torch.mean(
-            self.forecaster.loss(
-                prediction,
-                target_states,
-                pred_std,
-                mask=self.interior_mask_bool,
-            ),
-            dim=0,
-        )
-        mean_loss = torch.mean(time_step_loss)
-        self._warn_skipped_val_steps(len(time_step_loss), "test")
-
-        test_log_dict = {
-            f"test_loss_unroll{step}": time_step_loss[step - 1]
-            for step in self.hparams.val_steps_to_log
-            if step <= len(time_step_loss)
-        }
-        test_log_dict["test_mean_loss"] = mean_loss
-
-        self.log_dict(
-            test_log_dict,
-            on_step=False,
-            on_epoch=True,
-            sync_dist=True,
-            batch_size=batch[0].shape[0],
-        )
-
-        for metric_name in ("mse", "mae"):
-            metric_func = metrics.get_metric(metric_name)
-            batch_metric_vals = metric_func(
-                prediction,
-                target_states,
-                pred_std,
-                mask=self.interior_mask_bool,
-                sum_vars=False,
-            )
-            self.test_metrics[metric_name].append(batch_metric_vals)
-
-        spatial_loss = self.forecaster.loss(
-            prediction, target_states, pred_std, average_grid=False
-        )
-        log_spatial_losses = spatial_loss[
-            :,
-            [
-                step - 1
-                for step in self.hparams.val_steps_to_log
-                if step <= spatial_loss.shape[1]
-            ],
-        ]
-        self.spatial_loss_maps.append(log_spatial_losses)
-
-        if (
-            self.trainer.is_global_zero
-            and self.plotted_examples < self.n_example_pred
-        ):
-            n_additional_examples = min(
-                prediction.shape[0],
-                self.n_example_pred - self.plotted_examples,
-            )
-
-            self.plot_examples(
-                batch,
-                n_additional_examples,
-                prediction=prediction,
-                split="test",
-            )
 
     def plot_examples(self, batch, n_examples, split, prediction):
         """
@@ -867,82 +758,16 @@ class ForecasterModule(pl.LightningModule):
 
             plt.close("all")
 
+    @abstractmethod
     def on_test_epoch_end(self):
         """
         Perform actions at the end of the test epoch.
-        Aggregates and plots test metrics and spatial loss maps.
+
+        Concrete subclasses must at least aggregate and plot
+        ``self.test_metrics`` (typically via ``aggregate_and_plot_metrics``)
+        and reset any epoch-scoped state they accumulate during
+        ``test_step``.
         """
-        self.aggregate_and_plot_metrics(self.test_metrics, prefix="test")
-
-        spatial_loss_tensor = self.all_gather_cat(
-            torch.cat(self.spatial_loss_maps, dim=0)
-        )
-        if self.trainer.is_global_zero:
-            mean_spatial_loss = torch.mean(spatial_loss_tensor, dim=0)
-
-            loss_map_figs = [
-                vis.plot_spatial_error(
-                    error=loss_map,
-                    datastore=self.datastore,
-                    title=f"Test loss, t={t_i} "
-                    f"({(self.time_step_int * t_i)} {self.time_step_unit})",
-                )
-                for t_i, loss_map in zip(
-                    self.hparams.val_steps_to_log, mean_spatial_loss
-                )
-            ]
-
-            for i, fig in enumerate(loss_map_figs):
-                key = "test_loss"
-                if not isinstance(self.logger, pl.loggers.WandbLogger):
-                    key = f"{key}_{i}"
-                if hasattr(self.logger, "log_image"):
-                    self.logger.log_image(key=key, images=[fig])
-
-            pdf_loss_map_figs = [
-                vis.plot_spatial_error(error=loss_map, datastore=self.datastore)
-                for loss_map in mean_spatial_loss
-            ]
-            pdf_loss_maps_dir = os.path.join(
-                self.logger.save_dir, "spatial_loss_maps"
-            )
-            os.makedirs(pdf_loss_maps_dir, exist_ok=True)
-            for t_i, fig in zip(
-                self.hparams.val_steps_to_log, pdf_loss_map_figs
-            ):
-                fig.savefig(os.path.join(pdf_loss_maps_dir, f"loss_t{t_i}.pdf"))
-
-            torch.save(
-                mean_spatial_loss.cpu(),
-                os.path.join(self.logger.save_dir, "mean_spatial_loss.pt"),
-            )
-
-            if self.hparams.metrics_watch:
-                unmatched = (
-                    set(self.hparams.metrics_watch) - self.matched_metrics
-                )
-                if unmatched:
-                    warnings.warn(
-                        "The following metrics in --metrics_watch "
-                        "were not found during test phase: "
-                        f"{sorted(unmatched)}. Ensure the metric prefix "
-                        "matches the evaluation mode (expected 'test_')."
-                    )
-
-        self.matched_metrics = set()
-        self.spatial_loss_maps.clear()
-
-        # Clear stored test metrics so repeated `trainer.test()` calls on
-        # the same model instance start from a clean slate (otherwise the
-        # tensors accumulate and skew the aggregated metrics).
-        for metric_list in self.test_metrics.values():
-            metric_list.clear()
-
-        # Reset the example-plot counter so example prediction plots are
-        # generated again on every `trainer.test()` call, not just the
-        # first one (the guard `plotted_examples < n_example_pred` would
-        # otherwise stay permanently False).
-        self.plotted_examples = 0
 
     def on_load_checkpoint(self, checkpoint):
         """
