@@ -41,12 +41,19 @@ class BaseGraphEFM(StepPredictor):
     outside the predictor.
 
     This base class sets up everything that is independent of the mesh
-    graph type. Concrete subclasses are specific to a graph type: their
-    constructors verify the loaded graph is of the expected type, build the
-    mesh embedders and the prior/encoder/decoder latent modules, and they
-    implement :meth:`embedd_mesh`. See :class:`GraphEFM` (hierarchical
-    graph) and :class:`GraphEFMMultiScale` (flat graph).
+    graph type: it loads the graph, verifies it matches the type declared
+    by the subclass's ``expects_hierarchical`` class attribute, and builds
+    the prior (via :meth:`build_prior`, delegating to the subclass's
+    :meth:`build_learnable_prior` when learned). Concrete subclasses build
+    the mesh embedders and the encoder/decoder latent modules, and
+    implement :meth:`embedd_mesh` and :meth:`build_learnable_prior`. See
+    :class:`GraphEFM` (hierarchical graph) and :class:`GraphEFMMultiScale`
+    (flat graph).
     """
+
+    #: Set by concrete subclasses: whether they require a hierarchical
+    #: (True) or flat (False) mesh graph.
+    expects_hierarchical: bool
 
     def __init__(
         self,
@@ -55,6 +62,11 @@ class BaseGraphEFM(StepPredictor):
         graph_name: str,
         hidden_dim: int = 64,
         hidden_layers: int = 1,
+        latent_dim: Optional[int] = None,
+        learn_prior: bool = True,
+        prior_dist: str = "isotropic",
+        prior_layers: int = 2,
+        g2m_gnn_type: str = "InteractionNet",
         num_past_forcing_steps: int = 1,
         num_future_forcing_steps: int = 1,
         output_std: bool = False,
@@ -65,9 +77,9 @@ class BaseGraphEFM(StepPredictor):
         Set up the graph-type independent parts of the predictor.
 
         Loads the graph, builds the grid embedders, the grid-mesh edge
-        embedders and the constant per-variable std. Building the mesh
-        embedders and the prior/encoder/decoder latent modules is left to
-        the subclass constructor.
+        embedders, the constant per-variable std and the prior. Building
+        the mesh embedders and the encoder/decoder latent modules is left
+        to the subclass constructor.
 
         Parameters
         ----------
@@ -84,6 +96,25 @@ class BaseGraphEFM(StepPredictor):
             Dimensionality of internal node and edge representations.
         hidden_layers : int
             Number of hidden layers in internal MLPs.
+        latent_dim : int, optional
+            Dimensionality of the latent variable at each latent-carrying
+            mesh node (top level for hierarchical graphs, all mesh nodes
+            for flat graphs); defaults to ``hidden_dim`` when None. The
+            resolved value is stored as ``self.latent_dim`` for the
+            subclass to reuse when building its encoder/decoder.
+        learn_prior : bool
+            If True, the prior is the graph-type specific learnable encoder
+            built by :meth:`build_learnable_prior`, conditioned on the
+            previous state; if False, a constant ``Normal(0, 1)`` prior is
+            used.
+        prior_dist : str
+            Output distribution of the prior: ``"isotropic"`` or
+            ``"diagonal"``.
+        prior_layers : int
+            Number of on-mesh GNN layers in the learnable prior.
+        g2m_gnn_type : str
+            GNN type for the grid-to-mesh step of the prior (key in
+            ``gnn_layers.GNN_TYPES``).
         num_past_forcing_steps : int
             Number of past forcing steps included in the input window.
         num_future_forcing_steps : int
@@ -107,6 +138,23 @@ class BaseGraphEFM(StepPredictor):
         # Load graph with static features.
         self.hierarchical = utils.load_and_register_graph(
             self, datastore, graph_name
+        )
+        if self.hierarchical != self.expects_hierarchical:
+            expected_kind = (
+                "hierarchical" if self.expects_hierarchical else "flat"
+            )
+            actual_kind = "hierarchical" if self.hierarchical else "flat"
+            raise ValueError(
+                f"{type(self).__name__} requires a {expected_kind} mesh "
+                f"graph, but graph '{graph_name}' is {actual_kind}"
+            )
+
+        # The latent variable lives on the top mesh level for hierarchical
+        # graphs, and on every mesh node for flat graphs.
+        self.num_mesh_nodes = (
+            self.mesh_static_features[-1].shape[0]
+            if self.hierarchical
+            else self.mesh_static_features.shape[0]
         )
 
         # Specify dimensions of data
@@ -166,6 +214,18 @@ class BaseGraphEFM(StepPredictor):
         # inert -- accepted for interface parity with other StepPredictors.
         self.prepare_clamping_params(datastore)
 
+        # Prior over the latent variable.
+        self.latent_dim = latent_dim if latent_dim is not None else hidden_dim
+        self.prior_model = self.build_prior(
+            learn_prior=learn_prior,
+            latent_dim=self.latent_dim,
+            hidden_dim=hidden_dim,
+            hidden_layers=hidden_layers,
+            g2m_gnn_type=g2m_gnn_type,
+            prior_dist=prior_dist,
+            prior_layers=prior_layers,
+        )
+
     def build_prior(
         self,
         learn_prior,
@@ -182,7 +242,7 @@ class BaseGraphEFM(StepPredictor):
         When ``learn_prior`` is True the (graph-type specific) learnable prior
         is delegated to :meth:`build_learnable_prior`; otherwise the constant
         ``Normal(0, 1)`` prior, which is identical for every graph type, is
-        built here. Must be called after ``self.num_mesh_nodes`` is set.
+        built here.
 
         Parameters
         ----------
@@ -598,6 +658,8 @@ class GraphEFM(BaseGraphEFM):
     decoder is a ``HiGraphLatentDecoder``.
     """
 
+    expects_hierarchical = True
+
     def __init__(
         self,
         config: NeuralLAMConfig,
@@ -620,7 +682,8 @@ class GraphEFM(BaseGraphEFM):
         output_clamping_upper: Optional[Dict[str, float]] = None,
     ):
         """
-        Build the mesh embedders and hierarchical latent modules.
+        Build the mesh embedders and the hierarchical encoder/decoder
+        latent modules. The prior is built by the base class.
 
         Parameters
         ----------
@@ -639,9 +702,12 @@ class GraphEFM(BaseGraphEFM):
             Number of hidden layers in internal MLPs.
         latent_dim : int, optional
             Dimensionality of the latent variable at each top-level mesh
-            node; defaults to ``hidden_dim`` when None.
+            node; defaults to ``hidden_dim`` when None. Forwarded to the
+            base class, which resolves the default and stores it as
+            ``self.latent_dim``.
         prior_intra_level_layers : int
             Number of intra-level GNN layers in the (learned) prior.
+            Forwarded to the base class as ``prior_layers``.
         encoder_intra_level_layers : int
             Number of intra-level GNN layers in the variational encoder.
         decoder_intra_level_layers : int
@@ -649,10 +715,10 @@ class GraphEFM(BaseGraphEFM):
         learn_prior : bool
             If True, the prior is a hierarchical graph encoder conditioned
             on the previous state; if False, a constant ``Normal(0, 1)``
-            prior is used.
+            prior is used. Forwarded to the base class.
         prior_dist : str
             Output distribution of the prior: ``"isotropic"`` or
-            ``"diagonal"``.
+            ``"diagonal"``. Forwarded to the base class.
         num_past_forcing_steps : int
             Number of past forcing steps included in the input window.
         num_future_forcing_steps : int
@@ -678,6 +744,11 @@ class GraphEFM(BaseGraphEFM):
             graph_name=graph_name,
             hidden_dim=hidden_dim,
             hidden_layers=hidden_layers,
+            latent_dim=latent_dim,
+            learn_prior=learn_prior,
+            prior_dist=prior_dist,
+            prior_layers=prior_intra_level_layers,
+            g2m_gnn_type=g2m_gnn_type,
             num_past_forcing_steps=num_past_forcing_steps,
             num_future_forcing_steps=num_future_forcing_steps,
             output_std=output_std,
@@ -685,17 +756,9 @@ class GraphEFM(BaseGraphEFM):
             output_clamping_upper=output_clamping_upper,
         )
 
-        if not self.hierarchical:
-            raise ValueError(
-                f"{type(self).__name__} requires a hierarchical mesh graph, "
-                f"but graph '{graph_name}' is flat"
-            )
-
         level_mesh_sizes = [
             mesh_feat.shape[0] for mesh_feat in self.mesh_static_features
         ]
-        # The latent variable lives on the top mesh level
-        self.num_mesh_nodes = level_mesh_sizes[-1]
         num_levels = len(self.mesh_static_features)
         utils.log_on_rank_zero("Loaded hierarchical graph with structure:")
         for level_index, level_mesh_size in enumerate(level_mesh_sizes):
@@ -754,22 +817,9 @@ class GraphEFM(BaseGraphEFM):
                 ]
             )
 
-        latent_dim = latent_dim if latent_dim is not None else hidden_dim
-
-        # Prior (constant prior shared via the base class)
-        self.prior_model = self.build_prior(
-            learn_prior=learn_prior,
-            latent_dim=latent_dim,
-            hidden_dim=hidden_dim,
-            hidden_layers=hidden_layers,
-            g2m_gnn_type=g2m_gnn_type,
-            prior_dist=prior_dist,
-            prior_layers=prior_intra_level_layers,
-        )
-
         # Encoder (variational posterior) + Decoder
         self.encoder = HiGraphLatentEncoder(
-            latent_dim=latent_dim,
+            latent_dim=self.latent_dim,
             g2m_edge_index=self.g2m_edge_index,
             m2m_edge_index=self.m2m_edge_index,
             mesh_up_edge_index=self.mesh_up_edge_index,
@@ -786,7 +836,7 @@ class GraphEFM(BaseGraphEFM):
             mesh_up_edge_index=self.mesh_up_edge_index,
             mesh_down_edge_index=self.mesh_down_edge_index,
             hidden_dim=hidden_dim,
-            latent_dim=latent_dim,
+            latent_dim=self.latent_dim,
             num_state_vars=self.num_state_vars,
             intra_level_layers=decoder_intra_level_layers,
             hidden_layers=hidden_layers,
@@ -900,6 +950,8 @@ class GraphEFMMultiScale(BaseGraphEFM):
     ``GraphLatentDecoder``.
     """
 
+    expects_hierarchical = False
+
     def __init__(
         self,
         config: NeuralLAMConfig,
@@ -922,7 +974,8 @@ class GraphEFMMultiScale(BaseGraphEFM):
         output_clamping_upper: Optional[Dict[str, float]] = None,
     ):
         """
-        Build the mesh embedders and flat-graph latent modules.
+        Build the mesh embedders and the flat-graph encoder/decoder latent
+        modules. The prior is built by the base class.
 
         Parameters
         ----------
@@ -941,9 +994,12 @@ class GraphEFMMultiScale(BaseGraphEFM):
             Number of hidden layers in internal MLPs.
         latent_dim : int, optional
             Dimensionality of the latent variable at each mesh node;
-            defaults to ``hidden_dim`` when None.
+            defaults to ``hidden_dim`` when None. Forwarded to the base
+            class, which resolves the default and stores it as
+            ``self.latent_dim``.
         prior_m2m_layers : int
             Number of on-mesh (m2m) GNN layers in the (learned) prior.
+            Forwarded to the base class as ``prior_layers``.
         encoder_m2m_layers : int
             Number of on-mesh (m2m) GNN layers in the variational encoder.
         decoder_m2m_layers : int
@@ -951,10 +1007,10 @@ class GraphEFMMultiScale(BaseGraphEFM):
         learn_prior : bool
             If True, the prior is a graph encoder conditioned on the
             previous state; if False, a constant ``Normal(0, 1)`` prior is
-            used.
+            used. Forwarded to the base class.
         prior_dist : str
             Output distribution of the prior: ``"isotropic"`` or
-            ``"diagonal"``.
+            ``"diagonal"``. Forwarded to the base class.
         num_past_forcing_steps : int
             Number of past forcing steps included in the input window.
         num_future_forcing_steps : int
@@ -980,6 +1036,11 @@ class GraphEFMMultiScale(BaseGraphEFM):
             graph_name=graph_name,
             hidden_dim=hidden_dim,
             hidden_layers=hidden_layers,
+            latent_dim=latent_dim,
+            learn_prior=learn_prior,
+            prior_dist=prior_dist,
+            prior_layers=prior_m2m_layers,
+            g2m_gnn_type=g2m_gnn_type,
             num_past_forcing_steps=num_past_forcing_steps,
             num_future_forcing_steps=num_future_forcing_steps,
             output_std=output_std,
@@ -987,13 +1048,6 @@ class GraphEFMMultiScale(BaseGraphEFM):
             output_clamping_upper=output_clamping_upper,
         )
 
-        if self.hierarchical:
-            raise ValueError(
-                f"{type(self).__name__} requires a flat mesh graph, "
-                f"but graph '{graph_name}' is hierarchical"
-            )
-
-        self.num_mesh_nodes = self.mesh_static_features.shape[0]
         utils.log_on_rank_zero(
             f"Loaded graph with "
             f"{self.num_grid_nodes + self.num_mesh_nodes} nodes "
@@ -1008,22 +1062,9 @@ class GraphEFMMultiScale(BaseGraphEFM):
         m2m_dim = self.m2m_features.shape[1]
         self.m2m_embedder = utils.make_mlp([m2m_dim] + self.mlp_blueprint_end)
 
-        latent_dim = latent_dim if latent_dim is not None else hidden_dim
-
-        # Prior (constant prior shared via the base class)
-        self.prior_model = self.build_prior(
-            learn_prior=learn_prior,
-            latent_dim=latent_dim,
-            hidden_dim=hidden_dim,
-            hidden_layers=hidden_layers,
-            g2m_gnn_type=g2m_gnn_type,
-            prior_dist=prior_dist,
-            prior_layers=prior_m2m_layers,
-        )
-
         # Encoder (variational posterior) + Decoder
         self.encoder = GraphLatentEncoder(
-            latent_dim=latent_dim,
+            latent_dim=self.latent_dim,
             g2m_edge_index=self.g2m_edge_index,
             m2m_edge_index=self.m2m_edge_index,
             hidden_dim=hidden_dim,
@@ -1037,7 +1078,7 @@ class GraphEFMMultiScale(BaseGraphEFM):
             m2m_edge_index=self.m2m_edge_index,
             m2g_edge_index=self.m2g_edge_index,
             hidden_dim=hidden_dim,
-            latent_dim=latent_dim,
+            latent_dim=self.latent_dim,
             num_state_vars=self.num_state_vars,
             m2m_layers=decoder_m2m_layers,
             hidden_layers=hidden_layers,
