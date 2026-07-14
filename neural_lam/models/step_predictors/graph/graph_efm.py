@@ -3,7 +3,7 @@ predictors, for hierarchical (GraphEFM) and flat (GraphEFMMultiScale) mesh
 graphs."""
 
 # Standard library
-from typing import Callable, Dict, Optional
+from typing import Dict, Optional
 
 # Third-party
 import torch
@@ -11,9 +11,7 @@ from torch import nn
 
 # Local
 from .... import utils
-from ....config import NeuralLAMConfig
 from ....datastore import BaseDatastore
-from ....loss_weighting import get_state_feature_weighting
 from ...latent import (
     ConstantLatentEncoder,
     GraphLatentDecoder,
@@ -34,11 +32,11 @@ class BaseGraphEFM(StepPredictor):
     grid-to-mesh, on-mesh and mesh-to-grid GNNs. The
     encode-process-decode backbone of
     ``BaseGraphModel`` therefore does not apply -- this extends
-    ``StepPredictor`` directly. Besides ``forward`` (sampling a single step
-    from the prior) it exposes the per-step ELBO pieces
-    (``compute_step_loss`` -> ``(likelihood_term, kl_term, pred_mean,
-    pred_std)``). Rollout, ELBO assembly, ensemble logic and logging live
-    outside the predictor.
+    ``StepPredictor`` directly. ``forward`` samples a single step from the
+    prior. The encoder (variational posterior) and prior are exposed as
+    ``self.encoder``/``self.prior_model`` for a forecaster to condition on
+    the target and assemble a training objective from; the predictor itself
+    does not compute any loss.
 
     This base class sets up everything that is independent of the mesh
     graph type: it loads the graph, verifies it matches the type declared
@@ -57,7 +55,6 @@ class BaseGraphEFM(StepPredictor):
 
     def __init__(
         self,
-        config: NeuralLAMConfig,
         datastore: BaseDatastore,
         graph_name: str,
         hidden_dim: int = 64,
@@ -77,15 +74,11 @@ class BaseGraphEFM(StepPredictor):
         Set up the graph-type independent parts of the predictor.
 
         Loads the graph, builds the grid embedders, the grid-mesh edge
-        embedders, the constant per-variable std and the prior. Building
-        the mesh embedders and the encoder/decoder latent modules is left
-        to the subclass constructor.
+        embedders and the prior. Building the mesh embedders and the
+        encoder/decoder latent modules is left to the subclass constructor.
 
         Parameters
         ----------
-        config : NeuralLAMConfig
-            Full Neural-LAM configuration; used for the state feature
-            weighting that enters the constant per-variable std.
         datastore : BaseDatastore
             Datastore providing static features, standardization statistics
             and variable counts.
@@ -121,8 +114,7 @@ class BaseGraphEFM(StepPredictor):
             Number of future forcing steps included in the input window.
         output_std : bool
             If True, the decoder outputs a per-variable std alongside the
-            mean; if False, a constant per-variable std is used as
-            likelihood scale.
+            mean; if False, ``forward`` returns ``None`` for the std.
         output_clamping_lower : dict of str to float, optional
             Lower clamping limits per output variable.
         output_clamping_upper : dict of str to float, optional
@@ -183,31 +175,6 @@ class BaseGraphEFM(StepPredictor):
         # Embedders for mesh edges
         self.g2m_embedder = utils.make_mlp([g2m_dim] + self.mlp_blueprint_end)
         self.m2g_embedder = utils.make_mlp([m2g_dim] + self.mlp_blueprint_end)
-
-        # Constant per-variable std used as the (homoscedastic) likelihood
-        # scale when the decoder does not output its own std. Mirrors
-        # ForecasterModule's per_var_std formula
-        # (state_diff_std_standardized / sqrt(state_feature_weights)); both
-        # copies are persistent=False so there is no checkpoint interaction.
-        if not self.output_std:
-            da_state_stats = datastore.get_standardization_dataarray(
-                category="state"
-            )
-            state_diff_std = torch.tensor(
-                da_state_stats.state_diff_std_standardized.values,
-                dtype=torch.float32,
-            )
-            state_feature_weights = torch.tensor(
-                get_state_feature_weighting(config=config, datastore=datastore),
-                dtype=torch.float32,
-            )
-            self.register_buffer(
-                "per_var_std",
-                state_diff_std / torch.sqrt(state_feature_weights),
-                persistent=False,
-            )
-        else:
-            self.per_var_std = None
 
         # Compute indices and define clamping functions. GraphEFM's forward
         # never clamps (the decoder outputs the full next state), so these are
@@ -435,167 +402,6 @@ class BaseGraphEFM(StepPredictor):
 
         return grid_emb, graph_emb
 
-    def estimate_likelihood(
-        self,
-        latent_dist,
-        current_state,
-        last_state,
-        grid_prev_emb,
-        graph_emb,
-        loss_fn: Callable,
-        interior_mask: torch.Tensor,
-    ):
-        """
-        Estimate the (masked) likelihood using the given distribution over
-        latent variables.
-
-        ``loss_fn`` and ``interior_mask`` are passed in (not stored on the
-        predictor): masks live on the forecaster/module, which supplies its
-        own loss function and boolean interior mask.
-
-        Parameters
-        ----------
-        latent_dist : torch.distributions.Distribution
-            Shape ``(B, num_mesh_nodes, d_latent)``.
-        current_state : torch.Tensor
-            Shape ``(B, num_grid_nodes, d_state)``. Target ``X_{t+1}``.
-        last_state : torch.Tensor
-            Shape ``(B, num_grid_nodes, d_state)``. ``X_t``.
-        grid_prev_emb : torch.Tensor
-            Shape ``(B, num_grid_nodes, d_h)``. Grid embedding from
-            ``embedd_grid_and_graph``.
-        graph_emb : dict
-            Edge/mesh embeddings from ``embedd_grid_and_graph``.
-        loss_fn : Callable
-            Per-entry loss (e.g. ``metrics.nll``); likelihood is its negative.
-        interior_mask : torch.Tensor
-            Boolean ``(num_grid_nodes,)`` mask of interior nodes.
-
-        Returns
-        -------
-        likelihood_term : torch.Tensor
-            Shape ``(B,)``.
-        pred_mean : torch.Tensor
-            Shape ``(B, num_grid_nodes, d_state)``.
-        pred_std : torch.Tensor
-            Shape ``(B, num_grid_nodes, d_state)`` (decoder) or ``(d_state,)``
-            (constant ``per_var_std``).
-        """
-        # Sample from variational distribution
-        latent_samples = latent_dist.rsample()  # (B, num_mesh_nodes, d_latent)
-
-        # Compute reconstruction (decoder)
-        pred_mean, model_pred_std = self.decoder(
-            grid_prev_emb, latent_samples, last_state, graph_emb
-        )  # both (B, num_grid_nodes, d_state)
-
-        if self.output_std:
-            pred_std = model_pred_std  # (B, num_grid_nodes, d_state)
-        else:
-            # Use constant set std.-devs.
-            pred_std = self.per_var_std  # (d_f,)
-
-        # Compute likelihood (negative loss, exactly likelihood for nll loss)
-        # Note: There are some round-off errors here due to float32
-        # and large values
-        entry_likelihoods = -loss_fn(
-            pred_mean,
-            current_state,
-            pred_std,
-            mask=interior_mask,
-            average_grid=False,
-            sum_vars=False,
-        )  # (B, num_grid_nodes', d_state)
-        likelihood_term = torch.sum(entry_likelihoods, dim=(1, 2))  # (B,)
-        return likelihood_term, pred_mean, pred_std
-
-    def compute_step_loss(
-        self,
-        prev_states,
-        current_state,
-        forcing_features,
-        loss_fn: Callable,
-        interior_mask: torch.Tensor,
-        compute_kl: bool = True,
-    ):
-        """
-        Forward pass and per-step ELBO pieces for one time step.
-
-        Parameters
-        ----------
-        prev_states : torch.Tensor
-            Shape ``(B, 2, num_grid_nodes, d_state)``. ``X_{t-1}, X_t``.
-        current_state : torch.Tensor
-            Shape ``(B, num_grid_nodes, d_state)``. Target ``X_{t+1}``.
-        forcing_features : torch.Tensor
-            Shape ``(B, num_grid_nodes, d_forcing)``.
-        loss_fn : Callable
-            Per-entry loss used to compute the likelihood term.
-        interior_mask : torch.Tensor
-            Boolean ``(num_grid_nodes,)`` mask of interior nodes.
-        compute_kl : bool
-            When False, skip the prior and return ``kl_term = None`` (the
-            ``kl_beta == 0`` / pure-autoencoder case). The KL weight itself is
-            a training knob owned by the calling module.
-
-        Returns
-        -------
-        likelihood_term : torch.Tensor
-            Shape ``(B,)``.
-        kl_term : torch.Tensor or None
-            Shape ``(B,)``, or None when ``compute_kl`` is False.
-        pred_mean : torch.Tensor
-            Shape ``(B, num_grid_nodes, d_state)``.
-        pred_std : torch.Tensor
-            Shape ``(B, num_grid_nodes, d_state)`` or ``(d_state,)``.
-        """
-        # embed all features
-        grid_prev_emb, graph_emb = self.embedd_grid_and_graph(
-            prev_states[:, 1],
-            prev_states[:, 0],
-            forcing_features,
-        )
-        # embed also including current grid state, for encoder
-        grid_current_emb = self.embedd_grid_with_target(
-            prev_states[:, 1],
-            prev_states[:, 0],
-            forcing_features,
-            current_state,
-        )  # (B, num_grid_nodes, d_h)
-
-        # Compute variational approximation (encoder)
-        var_dist = self.encoder(
-            grid_current_emb, graph_emb=graph_emb
-        )  # Gaussian, (B, num_mesh_nodes, d_latent)
-
-        # Compute likelihood
-        last_state = prev_states[:, -1]
-        likelihood_term, pred_mean, pred_std = self.estimate_likelihood(
-            var_dist,
-            current_state,
-            last_state,
-            grid_prev_emb,
-            graph_emb,
-            loss_fn,
-            interior_mask,
-        )
-        if compute_kl:
-            # Compute prior
-            prior_dist = self.prior_model(
-                grid_prev_emb, graph_emb=graph_emb
-            )  # Gaussian, (B, num_mesh_nodes, d_latent)
-
-            # Compute KL
-            kl_term = torch.sum(
-                torch.distributions.kl_divergence(var_dist, prior_dist),
-                dim=(1, 2),
-            )  # (B,)
-        else:
-            # If KL is off, do not need to even compute prior nor KL
-            kl_term = None  # Set to None to crash if erroneously used
-
-        return likelihood_term, kl_term, pred_mean, pred_std
-
     def forward(
         self,
         prev_state: torch.Tensor,
@@ -662,7 +468,6 @@ class GraphEFM(BaseGraphEFM):
 
     def __init__(
         self,
-        config: NeuralLAMConfig,
         datastore: BaseDatastore,
         graph_name: str = "hierarchical",
         hidden_dim: int = 64,
@@ -687,9 +492,6 @@ class GraphEFM(BaseGraphEFM):
 
         Parameters
         ----------
-        config : NeuralLAMConfig
-            Full Neural-LAM configuration; used for the state feature
-            weighting that enters the constant per-variable std.
         datastore : BaseDatastore
             Datastore providing static features, standardization statistics
             and variable counts.
@@ -731,15 +533,13 @@ class GraphEFM(BaseGraphEFM):
             ``gnn_layers.GNN_TYPES``).
         output_std : bool
             If True, the decoder outputs a per-variable std alongside the
-            mean; if False, a constant per-variable std is used as
-            likelihood scale.
+            mean; if False, ``forward`` returns ``None`` for the std.
         output_clamping_lower : dict of str to float, optional
             Lower clamping limits per output variable.
         output_clamping_upper : dict of str to float, optional
             Upper clamping limits per output variable.
         """
         super().__init__(
-            config=config,
             datastore=datastore,
             graph_name=graph_name,
             hidden_dim=hidden_dim,
@@ -954,7 +754,6 @@ class GraphEFMMultiScale(BaseGraphEFM):
 
     def __init__(
         self,
-        config: NeuralLAMConfig,
         datastore: BaseDatastore,
         graph_name: str = "multiscale",
         hidden_dim: int = 64,
@@ -979,9 +778,6 @@ class GraphEFMMultiScale(BaseGraphEFM):
 
         Parameters
         ----------
-        config : NeuralLAMConfig
-            Full Neural-LAM configuration; used for the state feature
-            weighting that enters the constant per-variable std.
         datastore : BaseDatastore
             Datastore providing static features, standardization statistics
             and variable counts.
@@ -1023,15 +819,13 @@ class GraphEFMMultiScale(BaseGraphEFM):
             ``gnn_layers.GNN_TYPES``).
         output_std : bool
             If True, the decoder outputs a per-variable std alongside the
-            mean; if False, a constant per-variable std is used as
-            likelihood scale.
+            mean; if False, ``forward`` returns ``None`` for the std.
         output_clamping_lower : dict of str to float, optional
             Lower clamping limits per output variable.
         output_clamping_upper : dict of str to float, optional
             Upper clamping limits per output variable.
         """
         super().__init__(
-            config=config,
             datastore=datastore,
             graph_name=graph_name,
             hidden_dim=hidden_dim,
