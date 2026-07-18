@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [unreleased](https://github.com/mllam/neural-lam/compare/v0.6.0...HEAD)
 
 ### Added
+- Add `--num_sanity_val_steps` CLI argument to control sanity validation steps before training (#694)
+
+- Add `--train_steps_to_log` CLI option to log training loss for individual unroll steps, and deduplicate common prediction and loss computation steps across loops [\#674](https://github.com/mllam/neural-lam/issues/674) @GiGiKoneti
 
 - Add a general probabilistic forecasting interface (`ProbabilisticForecaster`,
   `ProbabilisticARForecaster`, `ProbabilisticForecasterModule`) and move
@@ -85,6 +88,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Maintenance
 
+- Split the monolithic `neural_lam/utils.py` into a `neural_lam/utils/` package with one module per concern (`buffer_list`, `graph`, `networks`, `plot`, `logging`, `tensor`, `time`); `utils/__init__.py` re-exports the full public API so existing imports are unaffected. Pure code movement, no behavioural change. [\#682](https://github.com/mllam/neural-lam/pull/682) @Sir-Sloth-The-Lazy
+
 - Add comprehensive type hints to GraphLAM in `neural_lam/models/step_predictors/graph/graph_lam.py` [\#669](https://github.com/mllam/neural-lam/pull/669) @GiGiKoneti
 
 - Add comprehensive type hints to ARForecaster in `neural_lam/models/forecasters/autoregressive.py` [\#663](https://github.com/mllam/neural-lam/pull/663) @GiGiKoneti
@@ -136,6 +141,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   documented in the README. The default GPU build moves from CUDA 12.8 to 13.0;
   users on other CUDA versions install the matching `torch` variant manually
   (see README) [\#604](https://github.com/mllam/neural-lam/pull/604) @RajdeepKushwaha5
+
+- Add edge count consistency check to `test_graph_creation.py` [#301](https://github.com/mllam/neural-lam/pull/301) @osten-antonio
 
 ## [v0.6.0](https://github.com/mllam/neural-lam/releases/tag/v0.6.0)
 

@@ -52,6 +52,7 @@ class BaseForecasterModule(pl.LightningModule, ABC):
         n_example_pred: int = 1,
         create_gif: bool = False,
         val_steps_to_log: list[int] | None = None,
+        train_steps_to_log: list[int] | None = None,
         metrics_watch: list[str] | None = None,
         var_leads_metrics_watch: dict[int, list[int]] | None = None,
         args=None,
@@ -81,6 +82,10 @@ class BaseForecasterModule(pl.LightningModule, ABC):
             Whether to create GIFs of example predictions.
         val_steps_to_log : list of int, optional
             Specific rollout steps to log during validation/testing.
+        train_steps_to_log : list of int, optional
+            Specific rollout steps to log during training. Accepted for CLI
+            and checkpoint compatibility; ``training_step`` only ever logs
+            the aggregate ``train_loss`` (see its docstring for why).
         metrics_watch : list of str, optional
             List of metrics to watch and log specifically.
         var_leads_metrics_watch : dict of {int: list of int}, optional
@@ -91,9 +96,9 @@ class BaseForecasterModule(pl.LightningModule, ABC):
             provided, attributes on ``args`` take precedence over the
             corresponding explicit kwargs (``lr``, ``restore_opt``,
             ``n_example_pred``, ``create_gif``, ``val_steps_to_log``,
-            ``metrics_watch``, ``var_leads_metrics_watch``) so legacy
-            checkpoints round-trip through ``load_from_checkpoint``
-            correctly.
+            ``train_steps_to_log``, ``metrics_watch``,
+            ``var_leads_metrics_watch``) so legacy checkpoints round-trip
+            through ``load_from_checkpoint`` correctly.
         """
         super().__init__()
         # Pre-refactor ``ARModel`` checkpoints saved every hyperparameter nested
@@ -110,6 +115,9 @@ class BaseForecasterModule(pl.LightningModule, ABC):
             val_steps_to_log = getattr(
                 args, "val_steps_to_log", val_steps_to_log
             )
+            train_steps_to_log = getattr(
+                args, "train_steps_to_log", train_steps_to_log
+            )
             metrics_watch = getattr(args, "metrics_watch", metrics_watch)
             var_leads_metrics_watch = getattr(
                 args, "var_leads_metrics_watch", var_leads_metrics_watch
@@ -120,6 +128,8 @@ class BaseForecasterModule(pl.LightningModule, ABC):
             val_steps_to_log = [
                 1,
             ]
+        if train_steps_to_log is None:
+            train_steps_to_log = []
         if metrics_watch is None:
             metrics_watch = []
         if var_leads_metrics_watch is None:
@@ -201,9 +211,12 @@ class BaseForecasterModule(pl.LightningModule, ABC):
         self.create_gif = create_gif
         self.plotted_examples = 0
 
-        # Warn once per phase if val_steps_to_log exceeds the actual rollout
-        self._val_steps_warn_issued = False
-        self._test_steps_warn_issued = False
+        # Warn once per phase if steps_to_log exceeds the actual rollout
+        self._steps_warn_issued = {
+            "val": False,
+            "test": False,
+            "train": False,
+        }
 
         self.time_step_int, self.time_step_unit = get_integer_time(
             self.datastore.step_length
@@ -335,7 +348,11 @@ class BaseForecasterModule(pl.LightningModule, ABC):
         The training objective is fully assembled by the wrapped forecaster,
         which owns its own scoring rule; this method injects the interior
         mask, then logs the loss and any loss components the forecaster
-        returns.
+        returns. Unlike validation/test, no per-step ``train_loss_unroll{i}``
+        breakdown is logged here even when ``train_steps_to_log`` is set:
+        ``compute_training_loss`` intentionally returns only a scalar (a
+        forecaster's objective, e.g. an ELBO, may not decompose per rollout
+        step at all), so there is no per-step tensor to select from.
 
         Parameters
         ----------
@@ -391,22 +408,60 @@ class BaseForecasterModule(pl.LightningModule, ABC):
         return gathered
 
     # pylint: disable-next=unused-argument
-    def _warn_skipped_val_steps(self, pred_steps: int, phase: str) -> None:
-        """Warn once per phase if any val_steps_to_log exceed pred_steps."""
-        flag = f"_{phase}_steps_warn_issued"
-        if getattr(self, flag):
+    def _warn_skipped_steps(self, pred_steps: int, phase: str) -> None:
+        """Warn once per phase if any log steps exceed pred_steps."""
+        if self._steps_warn_issued[phase]:
             return
-        invalid = [s for s in self.hparams.val_steps_to_log if s > pred_steps]
+        hparam_name = (
+            "train_steps_to_log" if phase == "train" else "val_steps_to_log"
+        )
+        steps_to_log = getattr(self.hparams, hparam_name, [])
+
+        invalid = [s for s in steps_to_log if s > pred_steps]
         if invalid:
             warnings.warn(
-                f"val_steps_to_log contains steps {invalid} that exceed "
+                f"{hparam_name} contains steps {invalid} that exceed "
                 f"the {phase} rollout length ({pred_steps}). "
                 "These steps will be skipped from logging. "
-                "Adjust --val_steps_to_log or the eval ar_steps.",
+                f"Adjust --{hparam_name} or the ar_steps.",
                 UserWarning,
                 stacklevel=2,
             )
-        setattr(self, flag, True)
+        self._steps_warn_issued[phase] = True
+
+    def _log_step_loss(
+        self,
+        time_step_loss: torch.Tensor,
+        mean_loss: torch.Tensor,
+        phase: str,
+        batch_size: int,
+    ) -> None:
+        """Log mean and step-wise losses for a given phase."""
+        self._warn_skipped_steps(len(time_step_loss), phase)
+
+        loss_key = "train_loss" if phase == "train" else f"{phase}_mean_loss"
+        log_dict = {loss_key: mean_loss}
+
+        hparam_name = (
+            "train_steps_to_log" if phase == "train" else "val_steps_to_log"
+        )
+        steps_to_log = getattr(self.hparams, hparam_name, [])
+
+        for step in steps_to_log:
+            if step <= len(time_step_loss):
+                log_dict[f"{phase}_loss_unroll{step}"] = time_step_loss[
+                    step - 1
+                ]
+
+        is_train = phase == "train"
+        self.log_dict(
+            log_dict,
+            prog_bar=is_train,
+            on_step=is_train,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=batch_size,
+        )
 
     @abstractmethod
     def validation_step(self, batch, batch_idx):

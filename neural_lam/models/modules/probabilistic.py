@@ -105,7 +105,7 @@ class ProbabilisticForecasterModule(BaseForecasterModule):
         )
         time_step_rmse = torch.sqrt(time_step_mse)
         mean_rmse = torch.mean(time_step_rmse)
-        self._warn_skipped_val_steps(len(time_step_rmse), phase)
+        self._warn_skipped_steps(len(time_step_rmse), phase)
 
         log_dict = {
             f"{phase}_ens_rmse_unroll{step}": time_step_rmse[step - 1]

@@ -77,21 +77,8 @@ class DeterministicForecasterModule(BaseForecasterModule):
             dim=0,
         )
         mean_loss = torch.mean(time_step_loss)
-        self._warn_skipped_val_steps(len(time_step_loss), "val")
-
-        val_log_dict = {
-            f"val_loss_unroll{step}": time_step_loss[step - 1]
-            for step in self.hparams.val_steps_to_log
-            if step <= len(time_step_loss)
-        }
-        val_log_dict["val_mean_loss"] = mean_loss
-        self.log_dict(
-            val_log_dict,
-            on_step=False,
-            on_epoch=True,
-            sync_dist=True,
-            batch_size=batch[0].shape[0],
-        )
+        batch_size = batch[0].shape[0]
+        self._log_step_loss(time_step_loss, mean_loss, "val", batch_size)
 
         entry_mses = self.forecaster.score(
             prediction,
@@ -133,22 +120,8 @@ class DeterministicForecasterModule(BaseForecasterModule):
             dim=0,
         )
         mean_loss = torch.mean(time_step_loss)
-        self._warn_skipped_val_steps(len(time_step_loss), "test")
-
-        test_log_dict = {
-            f"test_loss_unroll{step}": time_step_loss[step - 1]
-            for step in self.hparams.val_steps_to_log
-            if step <= len(time_step_loss)
-        }
-        test_log_dict["test_mean_loss"] = mean_loss
-
-        self.log_dict(
-            test_log_dict,
-            on_step=False,
-            on_epoch=True,
-            sync_dist=True,
-            batch_size=batch[0].shape[0],
-        )
+        batch_size = batch[0].shape[0]
+        self._log_step_loss(time_step_loss, mean_loss, "test", batch_size)
 
         for metric_name in ("mse", "mae"):
             batch_metric_vals = self.forecaster.score(
