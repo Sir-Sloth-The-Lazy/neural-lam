@@ -39,19 +39,17 @@ class BaseGraphEFM(StepPredictor):
     does not compute any loss.
 
     This base class sets up everything that is independent of the mesh
-    graph type: it loads the graph, verifies it matches the type declared
-    by the subclass's ``expects_hierarchical`` class attribute, and builds
-    the prior (via :meth:`build_prior`, delegating to the subclass's
-    :meth:`build_learnable_prior` when learned). Concrete subclasses build
-    the mesh embedders and the encoder/decoder latent modules, and
-    implement :meth:`embedd_mesh` and :meth:`build_learnable_prior`. See
-    :class:`GraphEFM` (hierarchical graph) and :class:`GraphEFMMultiScale`
-    (flat graph).
+    graph type: it loads the graph, calls the subclass's
+    :meth:`check_graph_type` to verify the loaded graph matches what it
+    requires, then builds the prior, delegating to the subclass's
+    :meth:`build_learnable_prior` when learned and to
+    :attr:`latent_spatial_dim` for the constant prior's node count.
+    Concrete subclasses build the mesh embedders and the encoder/decoder
+    latent modules, and implement :meth:`embedd_mesh`,
+    :meth:`check_graph_type`, :meth:`build_learnable_prior` and
+    :attr:`latent_spatial_dim`. See :class:`GraphEFM` (hierarchical graph)
+    and :class:`GraphEFMMultiScale` (flat graph).
     """
-
-    #: Set by concrete subclasses: whether they require a hierarchical
-    #: (True) or flat (False) mesh graph.
-    expects_hierarchical: bool
 
     def __init__(
         self,
@@ -139,23 +137,12 @@ class BaseGraphEFM(StepPredictor):
             graph_name,
             mesh_node_features_scaling=grid_xy_max_span,
         )
-        if self.hierarchical != self.expects_hierarchical:
-            expected_kind = (
-                "hierarchical" if self.expects_hierarchical else "flat"
-            )
-            actual_kind = "hierarchical" if self.hierarchical else "flat"
-            raise ValueError(
-                f"{type(self).__name__} requires a {expected_kind} mesh "
-                f"graph, but graph '{graph_name}' is {actual_kind}"
-            )
-
-        # The latent variable lives on the top mesh level for hierarchical
-        # graphs, and on every mesh node for flat graphs.
-        self.num_mesh_nodes = (
-            self.mesh_static_features[-1].shape[0]
-            if self.hierarchical
-            else self.mesh_static_features.shape[0]
-        )
+        # Delegated to the subclass, which knows whether it requires a
+        # hierarchical or flat mesh graph. Must run before anything below
+        # that assumes a specific graph shape (build_learnable_prior,
+        # latent_spatial_dim), so it cannot wait until the subclass
+        # constructor resumes after this call returns.
+        self.check_graph_type(graph_name)
 
         # Specify dimensions of data
         self.num_state_vars = datastore.get_num_data_vars(category="state")
@@ -189,74 +176,66 @@ class BaseGraphEFM(StepPredictor):
         # inert -- accepted for interface parity with other StepPredictors.
         self.prepare_clamping_params(datastore)
 
-        # Prior over the latent variable.
+        # Prior over the latent variable. When learn_prior is True the
+        # (graph-type specific) learnable prior is delegated to
+        # build_learnable_prior; otherwise the constant Normal(0, 1) prior,
+        # identical for every graph type, is built directly here.
         self.latent_dim = latent_dim if latent_dim is not None else hidden_dim
-        self.prior_model = self.build_prior(
-            learn_prior=learn_prior,
-            latent_dim=self.latent_dim,
-            hidden_dim=hidden_dim,
-            hidden_layers=hidden_layers,
-            g2m_gnn_type=g2m_gnn_type,
-            prior_dist=prior_dist,
-            prior_layers=prior_layers,
-        )
-
-    def build_prior(
-        self,
-        learn_prior,
-        latent_dim,
-        hidden_dim,
-        hidden_layers,
-        g2m_gnn_type,
-        prior_dist,
-        prior_layers,
-    ):
-        """
-        Build the prior over the latent variable.
-
-        When ``learn_prior`` is True the (graph-type specific) learnable prior
-        is delegated to :meth:`build_learnable_prior`; otherwise the constant
-        ``Normal(0, 1)`` prior, which is identical for every graph type, is
-        built here.
-
-        Parameters
-        ----------
-        learn_prior : bool
-            If True, build a learnable prior conditioned on the previous
-            state; if False, build a constant (input-independent) prior.
-        latent_dim : int
-            Dimensionality of the latent variable at each mesh node.
-        hidden_dim : int
-            Dimensionality of internal node and edge representations.
-        hidden_layers : int
-            Number of hidden layers in internal MLPs.
-        g2m_gnn_type : str
-            GNN type for the grid-to-mesh step of the learnable prior.
-        prior_dist : str
-            Output distribution of the prior: ``"isotropic"`` or
-            ``"diagonal"``.
-        prior_layers : int
-            Number of on-mesh GNN layers in the learnable prior.
-
-        Returns
-        -------
-        torch.nn.Module
-            The prior latent encoder.
-        """
         if learn_prior:
-            return self.build_learnable_prior(
-                latent_dim=latent_dim,
+            self.prior_model = self.build_learnable_prior(
+                latent_dim=self.latent_dim,
                 hidden_dim=hidden_dim,
                 hidden_layers=hidden_layers,
                 g2m_gnn_type=g2m_gnn_type,
                 prior_dist=prior_dist,
                 prior_layers=prior_layers,
             )
-        return ConstantLatentEncoder(
-            latent_dim=latent_dim,
-            num_mesh_nodes=self.num_mesh_nodes,
-            output_dist=prior_dist,
-        )
+        else:
+            self.prior_model = ConstantLatentEncoder(
+                latent_dim=self.latent_dim,
+                num_mesh_nodes=self.latent_spatial_dim,
+                output_dist=prior_dist,
+            )
+
+    def check_graph_type(self, graph_name: str) -> None:
+        """
+        Verify the loaded graph (``self.hierarchical``) is of the type this
+        predictor requires.
+
+        Implemented by the concrete subclass, which is the only place that
+        knows whether it requires a hierarchical or flat mesh graph. Called
+        by this base class right after loading the graph, before anything
+        that assumes a specific graph shape.
+
+        Parameters
+        ----------
+        graph_name : str
+            Name of the graph directory that was loaded, for the error
+            message.
+
+        Raises
+        ------
+        ValueError
+            If ``self.hierarchical`` does not match what this predictor
+            requires.
+        """
+        raise NotImplementedError("check_graph_type not implemented")
+
+    @property
+    def latent_spatial_dim(self) -> int:
+        """
+        Number of mesh nodes the latent variable lives on.
+
+        Implemented by the concrete subclass, which knows the mesh graph
+        type: the top mesh level for hierarchical graphs, or every mesh
+        node for flat graphs.
+
+        Returns
+        -------
+        int
+            Number of latent-carrying mesh nodes.
+        """
+        raise NotImplementedError("latent_spatial_dim not implemented")
 
     def build_learnable_prior(
         self,
@@ -472,8 +451,6 @@ class GraphEFM(BaseGraphEFM):
     decoder is a ``HiGraphLatentDecoder``.
     """
 
-    expects_hierarchical = True
-
     def __init__(
         self,
         datastore: BaseDatastore,
@@ -653,6 +630,40 @@ class GraphEFM(BaseGraphEFM):
             output_std=bool(output_std),
         )
 
+    def check_graph_type(self, graph_name: str) -> None:
+        """
+        Verify the loaded graph is hierarchical.
+
+        Parameters
+        ----------
+        graph_name : str
+            Name of the graph directory that was loaded, for the error
+            message.
+
+        Raises
+        ------
+        ValueError
+            If the loaded graph is flat.
+        """
+        if not self.hierarchical:
+            raise ValueError(
+                f"{type(self).__name__} requires a hierarchical mesh "
+                f"graph, but graph '{graph_name}' is flat"
+            )
+
+    @property
+    def latent_spatial_dim(self) -> int:
+        """
+        Number of mesh nodes on the top mesh level, where the latent
+        variable lives.
+
+        Returns
+        -------
+        int
+            Number of top-level mesh nodes.
+        """
+        return self.mesh_static_features[-1].shape[0]
+
     def build_learnable_prior(
         self,
         latent_dim,
@@ -758,8 +769,6 @@ class GraphEFMMultiScale(BaseGraphEFM):
     ``GraphLatentDecoder``.
     """
 
-    expects_hierarchical = False
-
     def __init__(
         self,
         datastore: BaseDatastore,
@@ -852,8 +861,8 @@ class GraphEFMMultiScale(BaseGraphEFM):
 
         utils.log_on_rank_zero(
             f"Loaded graph with "
-            f"{self.num_grid_nodes + self.num_mesh_nodes} nodes "
-            f"({self.num_grid_nodes} grid, {self.num_mesh_nodes} mesh)"
+            f"{self.num_grid_nodes + self.latent_spatial_dim} nodes "
+            f"({self.num_grid_nodes} grid, {self.latent_spatial_dim} mesh)"
         )
 
         # Embedders
@@ -888,6 +897,39 @@ class GraphEFMMultiScale(BaseGraphEFM):
             m2g_gnn_type=m2g_gnn_type,
             output_std=bool(output_std),
         )
+
+    def check_graph_type(self, graph_name: str) -> None:
+        """
+        Verify the loaded graph is flat.
+
+        Parameters
+        ----------
+        graph_name : str
+            Name of the graph directory that was loaded, for the error
+            message.
+
+        Raises
+        ------
+        ValueError
+            If the loaded graph is hierarchical.
+        """
+        if self.hierarchical:
+            raise ValueError(
+                f"{type(self).__name__} requires a flat mesh graph, "
+                f"but graph '{graph_name}' is hierarchical"
+            )
+
+    @property
+    def latent_spatial_dim(self) -> int:
+        """
+        Number of mesh nodes, where the latent variable lives.
+
+        Returns
+        -------
+        int
+            Number of mesh nodes.
+        """
+        return len(self.mesh_static_features)
 
     def build_learnable_prior(
         self,
