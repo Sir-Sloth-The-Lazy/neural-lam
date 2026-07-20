@@ -128,8 +128,16 @@ class BaseGraphEFM(StepPredictor):
         )
 
         # Load graph with static features.
+        grid_xy_extent = datastore.get_xy_extent(category="state")
+        grid_xy_max_span = max(
+            grid_xy_extent[1] - grid_xy_extent[0],
+            grid_xy_extent[3] - grid_xy_extent[2],
+        )
         self.hierarchical = utils.load_and_register_graph(
-            self, datastore, graph_name
+            self,
+            datastore,
+            graph_name,
+            mesh_node_features_scaling=grid_xy_max_span,
         )
         if self.hierarchical != self.expects_hierarchical:
             expected_kind = (
