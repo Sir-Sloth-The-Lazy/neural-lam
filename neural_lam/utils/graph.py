@@ -4,7 +4,7 @@
 import os
 import warnings
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Union
+from typing import Any, Union
 
 # Third-party
 import torch
@@ -12,12 +12,8 @@ import yaml
 from torch import nn
 
 # Local
+from ..datastore import BaseDatastore
 from .buffer_list import BufferList
-
-if TYPE_CHECKING:
-    # Imported only for type checking to avoid a runtime import cycle
-    # Local
-    from ..datastore import BaseDatastore
 
 LEGACY_GRAPH_SPEC_VERSION = "legacy"
 
@@ -428,7 +424,7 @@ def load_graph(
 
 def load_and_register_graph(
     module: nn.Module,
-    datastore: "BaseDatastore",
+    datastore: BaseDatastore,
     graph_name: str,
     mesh_node_features_scaling: float,
 ) -> bool:
@@ -472,7 +468,7 @@ def load_and_register_graph(
 
 
 def compute_grid_input_dim(
-    datastore: "BaseDatastore",
+    datastore: BaseDatastore,
     num_past_forcing_steps: int,
     num_future_forcing_steps: int,
 ) -> int:
